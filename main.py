@@ -13,7 +13,7 @@ import json
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from openai import OpenAI
-from supabase import create_client, Client
+from supabase import create_client
 from typing import Optional
 import uvicorn
 
@@ -26,7 +26,7 @@ app = FastAPI(
 
 # Initialize clients (will use environment variables)
 openai_client: Optional[OpenAI] = None
-supabase_client: Optional[Client] = None
+supabase_client = None
 
 def get_clients():
     """Initialize clients on first request"""
