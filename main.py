@@ -101,7 +101,7 @@ def search_cortex(
     
     # Call the search function in Supabase
     response = supabase.rpc(
-        'search_ict_chunks',
+        'search_ict_knowledge',
         {
             'query_embedding': query_embedding,
             'match_threshold': match_threshold,
@@ -114,14 +114,14 @@ def search_cortex(
     # Apply source filter if specified
     if source_filter:
         if source_filter.lower() == "ict":
-            results = [r for r in results if "vanessa" not in r.get("source", "").lower() 
-                      and "cues" not in r.get("source", "").lower()
-                      and "captivate" not in r.get("source", "").lower()]
+            results = [r for r in results if "vanessa" not in r.get("source_transcript", "").lower() 
+                      and "cues" not in r.get("source_transcript", "").lower()
+                      and "captivate" not in r.get("source_transcript", "").lower()]
         elif source_filter.lower() == "vanessa":
-            results = [r for r in results if "vanessa" in r.get("source", "").lower()
-                      or "cues" in r.get("source", "").lower()
-                      or "captivate" in r.get("source", "").lower()
-                      or "lie detection" in r.get("source", "").lower()]
+            results = [r for r in results if "vanessa" in r.get("source_transcript", "").lower()
+                      or "cues" in r.get("source_transcript", "").lower()
+                      or "captivate" in r.get("source_transcript", "").lower()
+                      or "lie detection" in r.get("source_transcript", "").lower()]
     
     return results
 
@@ -169,7 +169,7 @@ async def search(request: SearchRequest):
             results=[
                 SearchResult(
                     content=r.get("content", ""),
-                    source=r.get("source", "Unknown"),
+                    source=r.get("source_transcript", "Unknown"),
                     similarity=round(r.get("similarity", 0), 3)
                 )
                 for r in results
