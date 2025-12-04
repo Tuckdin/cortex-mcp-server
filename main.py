@@ -9,9 +9,7 @@ import json
 import logging
 from typing import Optional
 
-# CORRECT import - fastmcp package, NOT mcp.server.fastmcp
 from fastmcp import FastMCP
-
 from openai import OpenAI
 from supabase import create_client, Client
 
@@ -86,6 +84,7 @@ def search_cortex(query: str, source: Optional[str] = None, num_results: int = 5
         query_embedding = generate_embedding(query)
         supabase = get_supabase_client()
         
+        # Use the search_ict_knowledge RPC function
         response = supabase.rpc('search_ict_knowledge', {
             'query_embedding': query_embedding,
             'match_threshold': 0.5,
@@ -99,11 +98,12 @@ def search_cortex(query: str, source: Optional[str] = None, num_results: int = 5
         if source:
             source_lower = source.lower()
             if source_lower == "ict":
-                results = [r for r in results if "vanessa" not in r.get("source", "").lower()]
+                results = [r for r in results if "vanessa" not in r.get("source_transcript", "").lower()]
             elif source_lower == "vanessa":
-                results = [r for r in results if "vanessa" in r.get("source", "").lower()]
+                results = [r for r in results if "vanessa" in r.get("source_transcript", "").lower()]
         
-        formatted = [{"rank": i, "content": r.get("content", ""), "source": r.get("source", ""), 
+        # Note: search function returns source_transcript, not source
+        formatted = [{"rank": i, "content": r.get("content", ""), "source": r.get("source_transcript", ""), 
                       "similarity": round(r.get("similarity", 0), 4)} for i, r in enumerate(results, 1)]
         
         return json.dumps({"status": "success", "query": query, "results": formatted}, indent=2)
@@ -116,7 +116,8 @@ def get_cortex_stats() -> str:
     """Get statistics about The Cortex knowledge base."""
     try:
         supabase = get_supabase_client()
-        total_response = supabase.table('ict_knowledge').select('id', count='exact').execute()
+        # Correct table name: ict_chunks
+        total_response = supabase.table('ict_chunks').select('id', count='exact').execute()
         total_count = total_response.count if total_response.count else 0
         return json.dumps({"status": "success", "total_chunks": total_count})
     except Exception as e:
@@ -143,7 +144,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"Starting The Cortex MCP Server on port {port}...")
     
-    # FastMCP (the fastmcp package) supports host and port parameters
     mcp.run(
         transport="http",
         host="0.0.0.0",
