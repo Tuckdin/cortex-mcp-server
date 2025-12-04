@@ -1,7 +1,7 @@
 """
-The Cortex MCP Server
-A Model Context Protocol server for semantic search over ICT trading knowledge
-and Vanessa Van Edwards social intelligence content.
+The Cortex MCP Server - WITH INGESTION CAPABILITY
+A Model Context Protocol server for semantic search AND content ingestion
+over ICT trading knowledge and Vanessa Van Edwards social intelligence content.
 """
 
 import os
@@ -23,10 +23,15 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP(
     "cortex_mcp",
     instructions="""
-    The Cortex MCP Server provides semantic search over Mr. Pak's curated knowledge base:
-    - ICT Trading Knowledge: 776 transcripts covering order blocks, liquidity, market structure
+    The Cortex MCP Server provides semantic search AND ingestion over Mr. Pak's knowledge base:
+    - ICT Trading Knowledge: 776+ transcripts covering order blocks, liquidity, market structure
     - Social Intelligence: Vanessa Van Edwards' books on communication and social skills
-    Use search_cortex to find relevant information.
+    
+    Tools available:
+    - search_cortex: Semantic search with optional source filtering
+    - search_text: Direct text search for exact phrase matching
+    - ingest_content: Add new content to The Cortex
+    - get_cortex_stats: Database statistics
     """
 )
 
@@ -65,8 +70,23 @@ def generate_embedding(text: str) -> list[float]:
     return response.data[0].embedding
 
 
+def chunk_text(text: str, chunk_size: int = 600, overlap: int = 100) -> list[str]:
+    """Split text into overlapping chunks by approximate word count."""
+    words = text.split()
+    chunks = []
+    start = 0
+    
+    while start < len(words):
+        end = start + chunk_size
+        chunk = ' '.join(words[start:end])
+        chunks.append(chunk)
+        start = end - overlap
+        
+    return chunks
+
+
 # =============================================================================
-# MCP TOOLS
+# MCP TOOLS - SEARCH
 # =============================================================================
 
 @mcp.tool()
@@ -84,39 +104,177 @@ def search_cortex(query: str, source: Optional[str] = None, num_results: int = 5
         query_embedding = generate_embedding(query)
         supabase = get_supabase_client()
         
-        # Use the search_ict_knowledge RPC function
+        # Use lower threshold (0.35) for better recall
         response = supabase.rpc('search_ict_knowledge', {
             'query_embedding': query_embedding,
-            'match_threshold': 0.5,
-            'match_count': num_results
+            'match_threshold': 0.35,
+            'match_count': num_results * 2  # Get extra for filtering
         }).execute()
         
         if not response.data:
             return json.dumps({"status": "no_results", "message": f"No results for: {query}"})
         
         results = response.data
+        
+        # Apply source filter if specified
         if source:
             source_lower = source.lower()
             if source_lower == "ict":
-                results = [r for r in results if "vanessa" not in r.get("source_transcript", "").lower()]
+                results = [r for r in results if "vanessa" not in r.get("source_transcript", "").lower()
+                          and "cues" not in r.get("source_transcript", "").lower()
+                          and "captivate" not in r.get("source_transcript", "").lower()]
             elif source_lower == "vanessa":
-                results = [r for r in results if "vanessa" in r.get("source_transcript", "").lower()]
+                results = [r for r in results if any(term in r.get("source_transcript", "").lower() 
+                          for term in ["vanessa", "cues", "captivate", "lie detection"])]
         
-        # Note: search function returns source_transcript, not source
-        formatted = [{"rank": i, "content": r.get("content", ""), "source": r.get("source_transcript", ""), 
-                      "similarity": round(r.get("similarity", 0), 4)} for i, r in enumerate(results, 1)]
+        results = results[:num_results]
+        
+        formatted = [
+            {"rank": i, "content": r.get("content", ""), "source": r.get("source_transcript", ""), 
+             "similarity": round(r.get("similarity", 0), 4)}
+            for i, r in enumerate(results, 1)
+        ]
         
         return json.dumps({"status": "success", "query": query, "results": formatted}, indent=2)
     except Exception as e:
+        logger.error(f"Search error: {e}")
         return json.dumps({"status": "error", "message": str(e)})
 
+
+@mcp.tool()
+def search_text(query: str, num_results: int = 10) -> str:
+    """
+    Direct text search for exact phrase matching.
+    Use this when semantic search fails to find specific terms like 'turtle soup'.
+    
+    Args:
+        query: The exact text to search for.
+        num_results: Number of results (1-20, default 10).
+    """
+    try:
+        num_results = max(1, min(20, num_results))
+        supabase = get_supabase_client()
+        
+        response = supabase.table('ict_chunks') \
+            .select('id, content, source_transcript') \
+            .ilike('content', f'%{query}%') \
+            .limit(num_results) \
+            .execute()
+        
+        if not response.data:
+            return json.dumps({"status": "no_results", "message": f"No exact matches for: {query}"})
+        
+        formatted = [
+            {"rank": i, "content": r.get("content", ""), "source": r.get("source_transcript", "")}
+            for i, r in enumerate(response.data, 1)
+        ]
+        
+        return json.dumps({"status": "success", "query": query, "results": formatted, "count": len(formatted)}, indent=2)
+    except Exception as e:
+        logger.error(f"Text search error: {e}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+# =============================================================================
+# MCP TOOLS - INGESTION
+# =============================================================================
+
+@mcp.tool()
+def ingest_content(content: str, source_name: str) -> str:
+    """
+    Ingest new content into The Cortex.
+    Chunks the content, generates embeddings, and stores in Supabase.
+    
+    Args:
+        content: The full text content to ingest.
+        source_name: The source name (e.g., "ICT Turtle Soup Lecture.txt")
+    
+    Returns:
+        Status message with number of chunks ingested.
+    """
+    try:
+        if not content or len(content.strip()) < 100:
+            return json.dumps({"status": "error", "message": "Content too short (min 100 chars)"})
+        
+        # Chunk the content
+        chunks = chunk_text(content.strip())
+        logger.info(f"Ingesting {len(chunks)} chunks from: {source_name}")
+        
+        supabase = get_supabase_client()
+        ingested = 0
+        
+        for i, chunk in enumerate(chunks):
+            try:
+                # Generate embedding
+                embedding = generate_embedding(chunk)
+                
+                # Insert into Supabase
+                supabase.table('ict_chunks').insert({
+                    'content': chunk,
+                    'embedding': embedding,
+                    'source_transcript': source_name,
+                    'chunk_index': i,
+                    'total_chunks': len(chunks)
+                }).execute()
+                
+                ingested += 1
+                
+            except Exception as e:
+                logger.warning(f"Failed to ingest chunk {i}: {e}")
+        
+        return json.dumps({
+            "status": "success",
+            "message": f"Ingested {ingested}/{len(chunks)} chunks from {source_name}",
+            "source": source_name,
+            "chunks_created": ingested
+        })
+        
+    except Exception as e:
+        logger.error(f"Ingestion error: {e}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool()
+def check_source_exists(source_name: str) -> str:
+    """
+    Check if a source already exists in The Cortex.
+    
+    Args:
+        source_name: The source name to check for.
+    
+    Returns:
+        Whether the source exists and how many chunks it has.
+    """
+    try:
+        supabase = get_supabase_client()
+        
+        response = supabase.table('ict_chunks') \
+            .select('id') \
+            .eq('source_transcript', source_name) \
+            .execute()
+        
+        count = len(response.data) if response.data else 0
+        
+        return json.dumps({
+            "status": "success",
+            "source": source_name,
+            "exists": count > 0,
+            "chunk_count": count
+        })
+        
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+# =============================================================================
+# MCP TOOLS - STATS
+# =============================================================================
 
 @mcp.tool()
 def get_cortex_stats() -> str:
     """Get statistics about The Cortex knowledge base."""
     try:
         supabase = get_supabase_client()
-        # Correct table name: ict_chunks
         total_response = supabase.table('ict_chunks').select('id', count='exact').execute()
         total_count = total_response.count if total_response.count else 0
         return json.dumps({"status": "success", "total_chunks": total_count})
