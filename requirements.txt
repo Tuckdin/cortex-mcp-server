@@ -1,7 +1,4 @@
-# The Cortex MCP Server - Dependencies
-mcp>=1.0.0
+fastmcp>=2.0.0
 openai>=1.0.0
 supabase>=2.0.0
-pydantic>=2.0.0
 httpx>=0.25.0
-uvicorn>=0.24.0
