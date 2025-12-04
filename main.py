@@ -9,7 +9,9 @@ import json
 import logging
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+# CORRECT import - fastmcp package, NOT mcp.server.fastmcp
+from fastmcp import FastMCP
+
 from openai import OpenAI
 from supabase import create_client, Client
 
@@ -138,11 +140,12 @@ def search_social(query: str, num_results: int = 5) -> str:
 # =============================================================================
 
 if __name__ == "__main__":
-    # Set HOST for Railway (binds to all interfaces)
-    os.environ.setdefault("HOST", "0.0.0.0")
-    
-    port = os.environ.get("PORT", "8080")
+    port = int(os.environ.get("PORT", 8000))
     logger.info(f"Starting The Cortex MCP Server on port {port}...")
     
-    # FastMCP reads HOST and PORT from environment
-    mcp.run(transport="streamable-http")
+    # FastMCP (the fastmcp package) supports host and port parameters
+    mcp.run(
+        transport="http",
+        host="0.0.0.0",
+        port=port
+    )
