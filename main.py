@@ -1,7 +1,8 @@
 """
 The Cortex MCP Server
-ATLAS's bridge to the knowledge base
+ATLAS's semantic search interface to The Cortex knowledge base
 
+A proper MCP server using FastMCP with streamable-http transport.
 Searches the Supabase vector database containing:
 - 776 ICT trading transcripts (19,260 chunks)
 - 3 Vanessa Van Edwards books (897 chunks)
@@ -10,106 +11,92 @@ Searches the Supabase vector database containing:
 
 import os
 import json
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from typing import Optional
+from pydantic import BaseModel, Field, ConfigDict
+from mcp.server.fastmcp import FastMCP
 from openai import OpenAI
 from supabase import create_client
-from typing import Optional
-import uvicorn
 
-# Initialize FastAPI
-app = FastAPI(
-    title="The Cortex MCP Server",
-    description="ATLAS's semantic search interface to the knowledge base",
-    version="1.0.0"
+# Initialize FastMCP server
+mcp = FastMCP(
+    "cortex_mcp",
+    instructions="""You are connected to The Cortex - ATLAS's comprehensive knowledge base.
+    
+The Cortex contains:
+- 776 ICT (Inner Circle Trader) transcripts covering order blocks, liquidity, market structure, 
+  Fair Value Gaps, optimal trade entry, trading psychology, and all ICT methodology
+- 3 Vanessa Van Edwards books on social intelligence, body language, and communication
+
+When Mr. Pak asks about trading concepts, ICT methodology, social skills, or communication 
+strategies, use the search_cortex tool to retrieve relevant teachings.
+
+Always cite your sources: "According to ICT in [transcript name]..." or 
+"Vanessa Van Edwards teaches in [book name]..."
+"""
 )
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Global clients (initialized lazily)
+_openai_client: Optional[OpenAI] = None
+_supabase_client = None
 
-# Initialize clients (will use environment variables)
-openai_client: Optional[OpenAI] = None
-supabase_client = None
 
-def get_clients():
-    """Initialize clients on first request"""
-    global openai_client, supabase_client
-    
-    if openai_client is None:
-        openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    
-    if supabase_client is None:
-        supabase_client = create_client(
-            os.environ.get("SUPABASE_URL"),
-            os.environ.get("SUPABASE_KEY")
-        )
-    
-    return openai_client, supabase_client
+def get_openai() -> OpenAI:
+    """Get or create OpenAI client"""
+    global _openai_client
+    if _openai_client is None:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY environment variable not set")
+        _openai_client = OpenAI(api_key=api_key)
+    return _openai_client
 
-# Request/Response models
-class SearchRequest(BaseModel):
-    query: str
-    match_count: int = 5
-    match_threshold: float = 0.5
-    source_filter: Optional[str] = None  # "ict", "vanessa", or None for all
 
-class SearchResult(BaseModel):
-    content: str
-    source: str
-    similarity: float
+def get_supabase():
+    """Get or create Supabase client"""
+    global _supabase_client
+    if _supabase_client is None:
+        url = os.environ.get("SUPABASE_URL")
+        key = os.environ.get("SUPABASE_KEY")
+        if not url or not key:
+            raise ValueError("SUPABASE_URL and SUPABASE_KEY environment variables required")
+        _supabase_client = create_client(url, key)
+    return _supabase_client
 
-class SearchResponse(BaseModel):
-    query: str
-    results: list[SearchResult]
-    total_found: int
 
-class HealthResponse(BaseModel):
-    status: str
-    database: str
-    total_chunks: int
-
-# Embedding function
 def get_embedding(text: str) -> list[float]:
-    """Generate embedding using OpenAI"""
-    openai, _ = get_clients()
-    response = openai.embeddings.create(
+    """Generate embedding using OpenAI text-embedding-3-small"""
+    client = get_openai()
+    response = client.embeddings.create(
         model="text-embedding-3-small",
         input=text
     )
     return response.data[0].embedding
 
-# Search function
-def search_cortex(
+
+def perform_search(
     query: str,
     match_count: int = 5,
     match_threshold: float = 0.5,
     source_filter: Optional[str] = None
 ) -> list[dict]:
     """
-    Search The Cortex for relevant chunks
+    Execute semantic search against The Cortex
     
     Args:
-        query: The search query
+        query: Search query text
         match_count: Number of results to return
         match_threshold: Minimum similarity score (0-1)
-        source_filter: Optional filter - "ict" or "vanessa"
+        source_filter: "ict", "vanessa", or None for all
     
     Returns:
         List of matching chunks with content, source, and similarity
     """
-    _, supabase = get_clients()
+    supabase = get_supabase()
     
-    # Generate embedding for query
+    # Generate embedding for the query
     query_embedding = get_embedding(query)
     
-    # Call the search function in Supabase
+    # Call Supabase vector search function
     response = supabase.rpc(
         'search_ict_knowledge',
         {
@@ -123,111 +110,179 @@ def search_cortex(
     
     # Apply source filter if specified
     if source_filter:
-        if source_filter.lower() == "ict":
-            results = [r for r in results if "vanessa" not in r.get("source_transcript", "").lower() 
-                      and "cues" not in r.get("source_transcript", "").lower()
-                      and "captivate" not in r.get("source_transcript", "").lower()]
-        elif source_filter.lower() == "vanessa":
-            results = [r for r in results if "vanessa" in r.get("source_transcript", "").lower()
-                      or "cues" in r.get("source_transcript", "").lower()
-                      or "captivate" in r.get("source_transcript", "").lower()
-                      or "lie detection" in r.get("source_transcript", "").lower()]
+        filter_lower = source_filter.lower()
+        if filter_lower == "ict":
+            # Exclude Vanessa Van Edwards content
+            vanessa_indicators = ["vanessa", "cues", "captivate", "lie detection"]
+            results = [
+                r for r in results 
+                if not any(ind in r.get("source_transcript", "").lower() for ind in vanessa_indicators)
+            ]
+        elif filter_lower == "vanessa":
+            # Only Vanessa Van Edwards content
+            vanessa_indicators = ["vanessa", "cues", "captivate", "lie detection"]
+            results = [
+                r for r in results 
+                if any(ind in r.get("source_transcript", "").lower() for ind in vanessa_indicators)
+            ]
     
     return results
 
-# API Endpoints
-@app.get("/", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint"""
-    try:
-        _, supabase = get_clients()
-        # Get chunk count
-        response = supabase.table('ict_chunks').select('id', count='exact').execute()
-        total = response.count or 0
-        return HealthResponse(
-            status="healthy",
-            database="connected",
-            total_chunks=total
-        )
-    except Exception as e:
-        return HealthResponse(
-            status="error",
-            database=str(e),
-            total_chunks=0
-        )
 
-@app.post("/search", response_model=SearchResponse)
-async def search(request: SearchRequest):
-    """
-    Search The Cortex
+# Pydantic models for tool inputs
+class SearchCortexInput(BaseModel):
+    """Input parameters for searching The Cortex knowledge base."""
+    model_config = ConfigDict(str_strip_whitespace=True)
     
-    - **query**: What to search for
-    - **match_count**: Number of results (default 5)
-    - **match_threshold**: Minimum similarity 0-1 (default 0.5)
-    - **source_filter**: "ict" for trading, "vanessa" for social skills, or omit for all
+    query: str = Field(
+        ...,
+        description="The search query - describe the concept, topic, or question you want to find information about. Be specific for better results.",
+        min_length=2,
+        max_length=500
+    )
+    source: Optional[str] = Field(
+        default=None,
+        description="Filter results by source: 'ict' for ICT trading methodology only, 'vanessa' for Vanessa Van Edwards social skills only, or omit/null for all sources"
+    )
+    num_results: Optional[int] = Field(
+        default=5,
+        description="Number of results to return (1-10)",
+        ge=1,
+        le=10
+    )
+
+
+class GetStatsInput(BaseModel):
+    """Input for getting Cortex statistics."""
+    pass
+
+
+# MCP Tools
+@mcp.tool(
+    name="search_cortex",
+    annotations={
+        "title": "Search The Cortex Knowledge Base",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+async def search_cortex(params: SearchCortexInput) -> str:
+    """
+    Search The Cortex knowledge base for ICT trading concepts and Vanessa Van Edwards social intelligence frameworks.
+    
+    Use this tool when Mr. Pak asks about:
+    - ICT trading methodology (order blocks, liquidity, Fair Value Gaps, market structure, optimal trade entry)
+    - Trading psychology and discipline
+    - Social skills, body language, and communication strategies
+    - Conversation techniques and first impressions
+    
+    Returns relevant excerpts with source citations.
+    
+    Args:
+        params: SearchCortexInput containing query, optional source filter, and num_results
+    
+    Returns:
+        Formatted string with search results including content excerpts and sources
     """
     try:
-        results = search_cortex(
-            query=request.query,
-            match_count=request.match_count,
-            match_threshold=request.match_threshold,
-            source_filter=request.source_filter
+        results = perform_search(
+            query=params.query,
+            match_count=params.num_results or 5,
+            match_threshold=0.5,
+            source_filter=params.source
         )
         
-        return SearchResponse(
-            query=request.query,
-            results=[
-                SearchResult(
-                    content=r.get("content", ""),
-                    source=r.get("source_transcript", "Unknown"),
-                    similarity=round(r.get("similarity", 0), 3)
-                )
-                for r in results
-            ],
-            total_found=len(results)
-        )
+        if not results:
+            return f"No results found in The Cortex for: '{params.query}'\n\nTry rephrasing your query or broadening your search terms."
+        
+        # Format results for Claude
+        output_parts = [f"## The Cortex Search Results\n**Query:** {params.query}\n**Results Found:** {len(results)}\n"]
+        
+        for i, result in enumerate(results, 1):
+            content = result.get("content", "").strip()
+            source = result.get("source_transcript", "Unknown Source")
+            similarity = result.get("similarity", 0)
+            
+            # Truncate very long content
+            if len(content) > 1000:
+                content = content[:1000] + "..."
+            
+            output_parts.append(f"""
+---
+### Result {i} (Relevance: {similarity:.1%})
+**Source:** {source}
+
+{content}
+""")
+        
+        return "\n".join(output_parts)
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return f"Error searching The Cortex: {str(e)}"
 
-@app.get("/search/ict")
-async def search_ict(query: str, limit: int = 5):
-    """Quick endpoint for ICT-only searches"""
-    results = search_cortex(query, match_count=limit, source_filter="ict")
-    return {"query": query, "results": results}
 
-@app.get("/search/vanessa")
-async def search_vanessa(query: str, limit: int = 5):
-    """Quick endpoint for Vanessa Van Edwards searches"""
-    results = search_cortex(query, match_count=limit, source_filter="vanessa")
-    return {"query": query, "results": results}
-
-# MCP Tool Definition (for Claude integration)
-MCP_TOOLS = {
-    "search_cortex": {
-        "description": "Search The Cortex knowledge base containing ICT trading methodology and Vanessa Van Edwards social intelligence frameworks. Use this when Mr. Pak asks about trading concepts, market psychology, social skills, body language, or communication strategies.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query - what concept or topic to find"
-                },
-                "source": {
-                    "type": "string",
-                    "enum": ["all", "ict", "vanessa"],
-                    "description": "Filter by source: 'ict' for trading, 'vanessa' for social skills, 'all' for both"
-                }
-            },
-            "required": ["query"]
-        }
+@mcp.tool(
+    name="cortex_stats",
+    annotations={
+        "title": "Get Cortex Statistics",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
     }
-}
+)
+async def cortex_stats(params: GetStatsInput) -> str:
+    """
+    Get statistics about The Cortex knowledge base.
+    
+    Returns the total number of searchable chunks and confirms database connectivity.
+    
+    Args:
+        params: Empty input (no parameters needed)
+    
+    Returns:
+        String with Cortex statistics
+    """
+    try:
+        supabase = get_supabase()
+        response = supabase.table('ict_chunks').select('id', count='exact').execute()
+        total_chunks = response.count or 0
+        
+        return f"""## The Cortex Statistics
 
-@app.get("/mcp/tools")
-async def get_mcp_tools():
-    """Return MCP tool definitions for Claude integration"""
-    return MCP_TOOLS
+**Status:** Connected
+**Total Searchable Chunks:** {total_chunks:,}
 
+**Content Breakdown:**
+- ICT Trading Transcripts: ~776 files (~19,260 chunks)
+- Vanessa Van Edwards Books: 3 books (~897 chunks)
+
+**Available Sources:**
+- ICT methodology: Order blocks, liquidity, market structure, FVG, OTE, trading psychology
+- Vanessa Van Edwards: Cues, Captivate, body language, social intelligence
+"""
+    except Exception as e:
+        return f"Error connecting to The Cortex: {str(e)}"
+
+
+# Run the server
 if __name__ == "__main__":
+    import sys
+    
+    # Get port from environment (Railway sets this)
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    
+    # Check for required environment variables
+    required_vars = ["OPENAI_API_KEY", "SUPABASE_URL", "SUPABASE_KEY"]
+    missing = [var for var in required_vars if not os.environ.get(var)]
+    if missing:
+        print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
+        sys.exit(1)
+    
+    print(f"Starting The Cortex MCP Server on port {port}...")
+    print(f"Transport: streamable-http")
+    
+    # Run with streamable-http transport for remote access
+    mcp.run(transport="streamable-http", port=port)
